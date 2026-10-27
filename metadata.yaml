@@ -1,0 +1,7 @@
+name: astrbot_plugin_h42_dingtie_search
+display_name: 一梦江湖顶铁查询
+desc: 为大模型提供角色编号精确查询与关键词搜索工具，直接调用顶拍奖励号查询 API。
+version: v1.0.0
+author: julien
+repo: ""
+astrbot_version: ">=4.29.1,<5"

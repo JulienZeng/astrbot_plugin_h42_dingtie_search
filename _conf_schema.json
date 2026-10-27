@@ -1,0 +1,21 @@
+{
+  "api_base_url": {
+    "description": "查询 API 基础地址",
+    "type": "string",
+    "default": "",
+    "hint": "填写实际发布的完整地址，包含 /accounts，不包含 /search 或 /records/编号。插件会追加这些路径。"
+  },
+  "authorization": {
+    "description": "Authorization 请求头（可选）",
+    "type": "string",
+    "default": "",
+    "secret": true,
+    "hint": "无认证时留空；否则填写完整的 Basic <base64值> 或 Bearer <令牌>。仅用于请求后端，不作为模型参数。"
+  },
+  "timeout_seconds": {
+    "description": "请求超时（秒）",
+    "type": "int",
+    "default": 15,
+    "slider": {"min": 1, "max": 120, "step": 1}
+  }
+}
