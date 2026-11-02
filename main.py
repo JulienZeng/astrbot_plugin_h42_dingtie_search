@@ -1,15 +1,21 @@
-"""将一梦江湖顶铁查询 API 暴露为 AstrBot 的两个 LLM 工具。"""
+"""一梦江湖顶铁人员查询、待审核申请与消息附件上传工具。"""
 
+import asyncio
+import io
 import json
 import re
+from pathlib import Path
 from urllib.parse import urlsplit
 
 import aiohttp
 from astrbot.api import AstrBotConfig
 from astrbot.api.event import AstrMessageEvent, filter
+from astrbot.api.message_components import File, Image, Reply
 from astrbot.api.star import Context, Star
 
 ROLE_ID = re.compile(r"[0-9]{1,128}")
+MAX_FILE_BYTES = 10 * 1024 * 1024
+WRITE_STATE_KEY = "h42_dingtie_write_state"
 SCIENTIFIC_NUMBER = re.compile(
     r"(?<![A-Za-z0-9])(?:[0-9]+(?:\.[0-9]*)?|\.[0-9]+)e[+-]?[0-9]+",
     re.IGNORECASE,
@@ -34,6 +40,81 @@ def filters(server_name: str, high_risk: int) -> dict:
     if high_risk != -1:
         result["high_risk"] = high_risk
     return result
+
+
+def text_field(value: str, name: str, maximum: int, required: bool = True) -> str:
+    if not isinstance(value, str):
+        raise TypeError(f"{name} 必须是字符串")
+    value = value.strip()
+    # Java String.length() 按 UTF-16 计数，与后端的字段长度保持一致。
+    if (required and not value) or len(value.encode("utf-16-le")) // 2 > maximum:
+        raise ValueError(f"{name} {'必填，' if required else ''}长度不能超过 {maximum}")
+    return value
+
+
+def validate_role_id(value: str) -> str:
+    if not isinstance(value, str) or not ROLE_ID.fullmatch(value.strip()):
+        raise ValueError(
+            "role_id 必须是 1 到 128 位完整数字字符串，不能使用数值或科学计数法"
+        )
+    return value.strip()
+
+
+def validate_filename(value: str) -> str:
+    name = text_field(value, "filename", 128)
+    if (
+        name in (".", "..")
+        or "@@@@" in name
+        or re.search(r'[\\/<>:"|?*]', name)
+        or any(ord(char) < 32 or 127 <= ord(char) <= 159 for char in name)
+    ):
+        raise ValueError("filename 不能包含路径、控制字符、非法符号或 @@@@")
+    return name
+
+
+def message_attachments(event: AstrMessageEvent) -> list:
+    """只从本条消息及其直接引用的消息选择文件，模型不能指定本地路径或 URL。"""
+    result = []
+    for component in event.get_messages():
+        if isinstance(component, (File, Image)):
+            result.append(component)
+        elif isinstance(component, Reply):
+            result.extend(
+                item
+                for item in (component.chain or [])
+                if isinstance(item, (File, Image))
+            )
+    return result
+
+
+def write_state(event: AstrMessageEvent) -> dict:
+    state = event.get_extra(WRITE_STATE_KEY)
+    if state is None:
+        state = {
+            "submissions": {},
+            "uploads": {},
+            "submit_lock": asyncio.Lock(),
+            "upload_lock": asyncio.Lock(),
+        }
+        event.set_extra(WRITE_STATE_KEY, state)
+    return state
+
+
+def remember_write(result: dict) -> bool:
+    return (
+        result.get("success") is True
+        or result.get("outcome_unknown") is True
+        or result.get("error", {}).get("code")
+        in ("ALREADY_EXISTS", "ATTACHMENT_CONFLICT")
+    )
+
+
+def read_attachment(path: str) -> bytes:
+    file = Path(path)
+    if not path or not file.is_file():
+        raise ValueError("附件未解析为可读取的普通文件")
+    with file.open("rb") as content:
+        return content.read(MAX_FILE_BYTES + 1)
 
 
 class H42DingtieSearchPlugin(Star):
@@ -61,16 +142,12 @@ class H42DingtieSearchPlugin(Star):
             server_name(string): 区服精确筛选，默认空字符串表示不筛选；仅在用户明确要求时填写。
             high_risk(number): 整数高危筛选，默认 -1 表示不筛选，0 表示非高危，1 表示高危。
         """
-        if not isinstance(role_id, str) or not ROLE_ID.fullmatch(role_id.strip()):
-            return error_result(
-                "INVALID_ARGUMENT",
-                "role_id 必须是 1 到 128 位完整数字字符串，不能使用数值或科学计数法",
-            )
         try:
+            role_id = validate_role_id(role_id)
             params = filters(server_name, high_risk)
-        except ValueError as exc:
+        except (TypeError, ValueError) as exc:
             return error_result("INVALID_ARGUMENT", str(exc))
-        return await self._request("GET", f"/records/{role_id.strip()}", params=params)
+        return await self._request("GET", f"/records/{role_id}", params=params)
 
     @filter.llm_tool(name="h42_dingtie_search")
     async def h42_dingtie_search(
@@ -114,15 +191,289 @@ class H42DingtieSearchPlugin(Star):
             )
         try:
             body = filters(server_name, high_risk)
-        except ValueError as exc:
+        except (TypeError, ValueError) as exc:
             return error_result("INVALID_ARGUMENT", str(exc))
         body.update(query=query.strip(), limit=limit, offset=offset)
         return await self._request("POST", "/search", json=body)
 
-    async def _request(self, method: str, path: str, **kwargs) -> str:
+    @filter.llm_tool(name="h42_dingtie_submit")
+    async def h42_dingtie_submit(
+        self,
+        event: AstrMessageEvent,
+        role_id: str,
+        name: str,
+        server_name: str,
+        title: str,
+        description: str = "",
+        upload_attachments: bool = False,
+    ) -> str:
+        """仅 AstrBot 管理员明确要求提交时调用，创建待审核申请，可随后上传本条消息附件。
+
+        调用权限按当前消息发送者的 AstrBot 管理员身份检查，普通用户不能代管理员提交。
+        必须取得完整编号、角色名、区服和申请意图；title 可按本次申请生成，description 选填。
+        成功只代表申请已提交、等待审核，不是已通过或已进入公开查询。
+        申请中记录查不到是正常的；不得因查询 NOT_FOUND 而自动新增或重复提交。
+        人员重复 ALREADY_EXISTS 不覆盖原记录；outcome_unknown=true 时必须让管理员核对，禁止自动重试。
+        附件逐个上传，partial_success=true 表示申请已提交但部分附件失败，应列出失败文件，不能重新创建人员。
+
+        Args:
+            role_id(string): 完整数字字符串，1 到 128 位，保留前导零，禁止科学计数法或数值类型。
+            name(string): 用户提供的角色名，必填，最多 128 字符。
+            server_name(string): 用户提供的区服，必填，最多 128 字符。
+            title(string): 本次申请的流程标题，必填，最多 128 字符，例如顶铁人员申请 - 区服 / 角色名。
+            description(string): 可选申请说明，最多 2000 字符，默认空字符串，不编造缺失说明。
+            upload_attachments(boolean): 默认 false；用户要求把本条消息及直接引用消息中的全部文件或图片作为证据时设为 true。仅选部分附件时保持 false，随后逐个调用上传工具。
+        """
+        if event is None or not event.is_admin():
+            return error_result(
+                "PERMISSION_DENIED", "仅 AstrBot 管理员可以提交顶铁人员申请"
+            )
+        try:
+            role_id = validate_role_id(role_id)
+            body = {
+                "id": role_id,
+                "name": text_field(name, "name", 128),
+                "server_name": text_field(server_name, "server_name", 128),
+                "title": text_field(title, "title", 128),
+            }
+            description = text_field(description, "description", 2000, required=False)
+            if description:
+                body["description"] = description
+            if type(upload_attachments) is not bool:
+                raise ValueError("upload_attachments 必须是布尔值")
+            attachments = message_attachments(event) if upload_attachments else []
+            if upload_attachments and not attachments:
+                raise ValueError(
+                    "本条消息及直接引用的消息没有可上传的文件或图片，请发送实际附件"
+                )
+        except (TypeError, ValueError) as exc:
+            return error_result("INVALID_ARGUMENT", str(exc))
+
+        state = write_state(event)
+        async with state["submit_lock"]:
+            cached = state["submissions"].get(role_id)
+            if cached is not None:
+                return json.dumps({**cached, "reused_result": True}, ensure_ascii=False)
+            result = json.loads(
+                await self._request(
+                    "POST", "/records", operation="submit", role_id=role_id, json=body
+                )
+            )
+            if remember_write(result):
+                state["submissions"][role_id] = result
+            if result.get("success") is not True:
+                return json.dumps(result, ensure_ascii=False)
+
+            result["message"] = "申请已提交，等待审核；申请中不会出现在公开查询中"
+            if attachments:
+                uploads = []
+                for index in range(1, len(attachments) + 1):
+                    uploads.append(
+                        json.loads(
+                            await self.h42_dingtie_upload_attachment(
+                                event, role_id, index
+                            )
+                        )
+                    )
+                result["attachments"] = uploads
+                result["partial_success"] = any(
+                    item.get("success") is not True for item in uploads
+                )
+                if result["partial_success"]:
+                    result["message"] = (
+                        "人员申请已提交，部分附件上传失败；请核对失败文件，不要重复新增人员"
+                    )
+            return json.dumps(result, ensure_ascii=False)
+
+    @filter.llm_tool(name="h42_dingtie_upload_attachment")
+    async def h42_dingtie_upload_attachment(
+        self,
+        event: AstrMessageEvent,
+        role_id: str,
+        attachment_index: int = 1,
+        filename: str = "",
+    ) -> str:
+        """仅 AstrBot 管理员可向已提交且待审核的申请上传本条消息中的一个实际附件。
+
+        调用权限按当前消息发送者的 AstrBot 管理员身份检查，普通用户不能代管理员上传。
+        仅在用户要求上传证据时调用，使用角色编号而不是 record_id、bind_id 或 file_id。
+        文件来源只限本条消息及直接引用消息中的文件/图片；不接受本地路径、URL、Base64 或文件 ID。
+        请求发送原始字节，单文件非空且不超过 10 MiB；多文件按序逐个调用。
+        附件失败不会回滚人员申请，不能因此重复创建人员。
+        NOT_FOUND 表示上传目标不存在，ATTACHMENT_CONFLICT 表示同名附件或状态冲突，均不能当作成功。
+        outcome_unknown=true 表示保存状态不确定，请管理员核对，禁止自动重试或改名重复上传。
+        file_id 只是附件标识，不能拼造下载地址；查询接口不返回图片。
+
+        Args:
+            role_id(string): 已提交申请的完整角色编号字符串，保留全部数字和前导零。
+            attachment_index(number): 文件或图片在当前消息中的序号，从 1 开始，默认 1；引用消息中的附件在引用段位置展开计数。
+            filename(string): 可选上传文件名，默认保留文件原名或为图片生成文件名；最多 128 字符，不允许路径、控制字符或 @@@@。用户明确指定名称时才填写。
+        """
+        if event is None or not event.is_admin():
+            return error_result(
+                "PERMISSION_DENIED", "仅 AstrBot 管理员可以上传申请附件"
+            )
+        try:
+            role_id = validate_role_id(role_id)
+            attachments = message_attachments(event)
+            if type(attachment_index) is not int or not 1 <= attachment_index <= len(
+                attachments
+            ):
+                raise ValueError(
+                    f"attachment_index 必须是 1 到 {len(attachments)} 的整数；没有附件时请发送实际文件"
+                )
+            filename = text_field(filename, "filename", 128, required=False)
+            component = attachments[attachment_index - 1]
+            if filename or (isinstance(component, File) and component.name):
+                filename = validate_filename(filename or component.name)
+        except (TypeError, ValueError) as exc:
+            return error_result(
+                "INVALID_ARGUMENT",
+                str(exc),
+                role_id=role_id,
+                attachment_index=attachment_index,
+            )
+
+        state = write_state(event)
+        async with state["upload_lock"]:
+            submission = state["submissions"].get(role_id, {})
+            if submission.get("outcome_unknown"):
+                return error_result(
+                    "SUBMISSION_UNCERTAIN",
+                    "人员申请状态尚未确认，请管理员核对后再上传",
+                    role_id=role_id,
+                    attachment_index=attachment_index,
+                )
+            component = attachments[attachment_index - 1]
+            # 图片扩展名从框架解析后的文件读取，文件消息保留原名。
+            try:
+                timeout = self.config.get("upload_timeout_seconds", 60)
+                if type(timeout) not in (int, float) or not 0 < timeout <= 120:
+                    return error_result(
+                        "CONFIG_ERROR", "upload_timeout_seconds 必须在 1 到 120 秒之间"
+                    )
+                async with asyncio.timeout(timeout):
+                    path = (
+                        await component.get_file()
+                        if isinstance(component, File)
+                        else await component.convert_to_file_path()
+                    )
+                    filename = validate_filename(
+                        filename
+                        or (component.name if isinstance(component, File) else "")
+                        or f"evidence_{attachment_index}{Path(path).suffix or '.bin'}"
+                    )
+                    key = (role_id, filename)
+                    cached = state["uploads"].get(key)
+                    if cached is not None:
+                        return json.dumps(
+                            {**cached, "reused_result": True}, ensure_ascii=False
+                        )
+                    content = await asyncio.to_thread(read_attachment, path)
+            except Exception as exc:  # noqa: BLE001 -- 各平台附件适配器的异常类型不统一
+                # 适配器解析失败不代表服务端写入失败；不回显本地路径或下载链接。
+                return error_result(
+                    "ATTACHMENT_READ_FAILED",
+                    "无法读取消息附件或文件名不合法，请检查附件后重新发送",
+                    role_id=role_id,
+                    attachment_index=attachment_index,
+                    file_name=filename,
+                    error_type=type(exc).__name__,
+                )
+
+            if not content or len(content) > MAX_FILE_BYTES:
+                return error_result(
+                    "FILE_TOO_LARGE" if content else "INVALID_ARGUMENT",
+                    "单个附件必须非空且不能超过 10 MiB",
+                    role_id=role_id,
+                    attachment_index=attachment_index,
+                    file_name=filename,
+                )
+            names = [
+                item["data"]["file_name"]
+                for (rid, _), item in state["uploads"].items()
+                if rid == role_id and item.get("success") is True
+            ]
+            if len("@@@@".join([*names, filename]).encode("utf-16-le")) // 2 > 128:
+                return error_result(
+                    "INVALID_ARGUMENT",
+                    "附件文件名合计长度（含 @@@@ 分隔符）不能超过 128",
+                    role_id=role_id,
+                    attachment_index=attachment_index,
+                    file_name=filename,
+                )
+
+            with io.BytesIO(content) as content_stream:
+                result = json.loads(
+                    await self._request(
+                        "POST",
+                        f"/records/{role_id}/attachments",
+                        operation="upload",
+                        role_id=role_id,
+                        params={"filename": filename},
+                        data=content_stream,
+                        headers={"Content-Type": "application/octet-stream"},
+                    )
+                )
+            result.update(
+                role_id=role_id, attachment_index=attachment_index, file_name=filename
+            )
+            if result.get("success") is True and (
+                result["data"].get("file_name") != filename
+                or result["data"].get("file_size") != len(content)
+            ):
+                result = json.loads(
+                    error_result(
+                        "INVALID_RESPONSE",
+                        "附件响应与上传的文件名或大小不一致，请管理员核对，禁止自动重试",
+                        role_id=role_id,
+                        attachment_index=attachment_index,
+                        file_name=filename,
+                        outcome_unknown=True,
+                    )
+                )
+            if result.get("success") is not True:
+                result["message"] = (
+                    "本次附件未确认上传成功；人员申请不会回滚，请勿因此重复新增人员"
+                )
+            if remember_write(result):
+                state["uploads"][key] = result
+            return json.dumps(result, ensure_ascii=False)
+
+    async def _request(
+        self,
+        method: str,
+        path: str,
+        *,
+        operation: str = "query",
+        role_id: str = "",
+        **kwargs,
+    ) -> str:
+        is_write = operation in ("submit", "upload")
+
+        def failure(
+            code: str,
+            message: str,
+            *,
+            status: int | None = None,
+            uncertain: bool = False,
+        ) -> str:
+            extra = {"http_status": status} if status is not None else {}
+            if is_write:
+                extra.update(
+                    operation=operation, role_id=role_id, outcome_unknown=uncertain
+                )
+                if uncertain:
+                    message += "；写入状态不确定，请管理员核对，禁止自动重试"
+            return error_result(code, message, **extra)
+
         base_url = self.config.get("api_base_url", "")
         authorization = self.config.get("authorization", "")
-        timeout = self.config.get("timeout_seconds", 15)
+        timeout = (
+            self.config.get("upload_timeout_seconds", 60)
+            if operation == "upload"
+            else self.config.get("timeout_seconds", 15)
+        )
         try:
             if not isinstance(base_url, str) or not isinstance(authorization, str):
                 raise TypeError
@@ -138,14 +489,17 @@ class H42DingtieSearchPlugin(Star):
                 or parts.fragment
             ):
                 raise ValueError
+            # 兼容旧配置（以 /accounts 结尾）和交接文档的服务发布基址。
+            if not parts.path.rstrip("/").endswith("/accounts"):
+                base_url += "/accounts"
             if type(timeout) not in (int, float) or not 0 < timeout <= 120:
                 raise ValueError
             if "\r" in authorization or "\n" in authorization:
                 raise ValueError
         except (TypeError, ValueError):
-            return error_result(
+            return failure(
                 "CONFIG_ERROR",
-                "请配置有效的 api_base_url（包含 /accounts 路径，不含查询参数或账号密码）、"
+                "请配置有效的 api_base_url（服务基址或包含 /accounts 的地址，不含查询参数或账号密码）、"
                 "单行 Authorization 和 1 到 120 秒的超时",
             )
 
@@ -163,30 +517,41 @@ class H42DingtieSearchPlugin(Star):
             ):
                 status = response.status
                 if status in (401, 403):
-                    return error_result(
+                    return failure(
                         "AUTH_ERROR",
                         "接口认证失败，请检查 Authorization 或 API 访问权限",
-                        http_status=status,
+                        status=status,
                     )
                 if 300 <= status < 400:
-                    return error_result(
+                    return failure(
                         "HTTP_ERROR",
                         "接口发生重定向，请配置最终的 API 地址",
-                        http_status=status,
+                        status=status,
                     )
                 try:
                     payload = await response.json(content_type=None)
                 except (ValueError, UnicodeError):
-                    return error_result(
-                        "INVALID_RESPONSE",
-                        "接口未返回有效 JSON，请检查 API 地址和网关配置",
-                        http_status=status,
+                    return failure(
+                        "FILE_TOO_LARGE" if status == 413 else "INVALID_RESPONSE",
+                        "接口拒绝文件大小，单文件不能超过 10 MiB"
+                        if status == 413
+                        else "接口未返回有效 JSON，请检查 API 地址、后端部署及发布配置",
+                        status=status,
+                        uncertain=is_write and (200 <= status < 300 or status >= 500),
                     )
         except TimeoutError:
-            return error_result("TIMEOUT", "接口请求超时，无法判断是否收录，请稍后重试")
+            return failure(
+                "TIMEOUT",
+                "接口请求超时"
+                if is_write
+                else "接口请求超时，无法判断是否收录，请稍后重试",
+                uncertain=is_write,
+            )
         except (aiohttp.ClientError, ValueError):
-            return error_result(
-                "NETWORK_ERROR", "无法连接查询接口，请检查 API 地址、网络及证书"
+            return failure(
+                "NETWORK_ERROR",
+                "接口通信失败，请检查 API 地址、网络及证书",
+                uncertain=is_write,
             )
 
         if isinstance(payload, dict) and payload.get("success") is False:
@@ -197,24 +562,69 @@ class H42DingtieSearchPlugin(Star):
                 and isinstance(error.get("message"), str)
                 # 只有精确查询接口约定的 404 才能解释为角色未收录。
                 and (
-                    error["code"] != "NOT_FOUND" or (method == "GET" and status == 404)
+                    error["code"] != "NOT_FOUND"
+                    or ((method == "GET" or operation == "upload") and status == 404)
                 )
             ):
-                return error_result(error["code"], error["message"], http_status=status)
+                return failure(
+                    error["code"],
+                    error["message"],
+                    status=status,
+                    uncertain=is_write and status >= 500,
+                )
         if status >= 400:
-            return error_result(
-                "HTTP_ERROR",
-                f"查询接口返回 HTTP {status}，无法判断是否收录",
-                http_status=status,
+            return failure(
+                "FILE_TOO_LARGE" if status == 413 else "HTTP_ERROR",
+                f"接口返回 HTTP {status}，本次操作未确认成功",
+                status=status,
+                uncertain=is_write and status >= 500,
             )
         if (
             not isinstance(payload, dict)
             or payload.get("success") is not True
             or not isinstance(payload.get("data"), dict)
         ):
-            return error_result("INVALID_RESPONSE", "接口响应不符合 success/data 协议")
+            return failure(
+                "INVALID_RESPONSE",
+                "接口响应不符合 success/data 协议",
+                status=status,
+                uncertain=is_write,
+            )
 
         data = payload["data"]
+        if is_write:
+            valid = (
+                status == 201
+                and data.get("id") == role_id
+                and isinstance(data.get("record_id"), str)
+                and bool(data["record_id"])
+            )
+            if operation == "submit":
+                valid = (
+                    valid
+                    and type(data.get("review_status")) is int
+                    and data["review_status"] == 0
+                    and isinstance(data.get("bind_id"), str)
+                    and bool(data["bind_id"])
+                )
+            else:
+                valid = (
+                    valid
+                    and isinstance(data.get("file_id"), str)
+                    and bool(data["file_id"])
+                    and isinstance(data.get("file_name"), str)
+                    and type(data.get("file_size")) is int
+                    and 0 < data["file_size"] <= MAX_FILE_BYTES
+                )
+            if not valid:
+                return failure(
+                    "INVALID_RESPONSE",
+                    "提交或上传响应不符合 201 及返回字段约定",
+                    status=status,
+                    uncertain=True,
+                )
+            data.pop("images", None)
+            return json.dumps(payload, ensure_ascii=False)
         if method == "GET":
             records = [data]
             if data.get("id") != path.removeprefix("/records/"):

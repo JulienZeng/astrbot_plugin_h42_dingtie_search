@@ -1,9 +1,9 @@
 {
   "api_base_url": {
-    "description": "查询 API 基础地址",
+    "description": "顶铁人员 Web API 基础地址",
     "type": "string",
     "default": "",
-    "hint": "填写实际发布的完整地址，包含 /accounts，不包含 /search 或 /records/编号。插件会追加这些路径。"
+    "hint": "填写 hikingAccounts 的实际服务发布基址，或沿用以 /accounts 结尾的旧配置。插件自动补齐 /accounts，不重复拼接；不要填写 /search 或 /records/编号。"
   },
   "authorization": {
     "description": "Authorization 请求头（可选）",
@@ -13,9 +13,16 @@
     "hint": "无认证时留空；否则填写完整的 Basic <base64值> 或 Bearer <令牌>。仅用于请求后端，不作为模型参数。"
   },
   "timeout_seconds": {
-    "description": "请求超时（秒）",
+    "description": "查询及申请请求超时（秒）",
     "type": "int",
     "default": 15,
     "slider": {"min": 1, "max": 120, "step": 1}
+  },
+  "upload_timeout_seconds": {
+    "description": "附件读取及上传超时（秒）",
+    "type": "int",
+    "default": 60,
+    "slider": {"min": 1, "max": 120, "step": 1},
+    "hint": "每个附件读取和上传各使用此超时。写入超时后不自动重试，应核对服务端状态。"
   }
 }
